@@ -1,0 +1,51 @@
+name: CodeReview
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get git diff
+        run: |
+          git fetch origin
+          git diff --unified=3 ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} > diff.txt
+          echo "DIFF_CONTENT<<EOF" >> $GITHUB_ENV
+          cat diff.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Request code review to LLM
+        run: |
+          ESCAPED_DIFF=$(echo "$DIFF_CONTENT" | jq -sRr @json)
+          REQUEST_BODY=$(jq -n \
+            --arg model "${{ secrets.REVIEW_MODEL_NAME }}" \
+            --arg prompt "Review the following code changes and provide concise feedback:\n$ESCAPED_DIFF" \
+            '{model: $model, prompt: $prompt, stream: false}')
+          RESPONSE=$(curl -s -X POST ${{ secrets.REVIEW_API_URL }} \
+            -H "Content-Type: application/json" \
+            -d "$REQUEST_BODY" | jq -r .response)
+          echo "REVIEW_RESPONSE<<EOF" >> $GITHUB_ENV
+          echo "$RESPONSE" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Post review comment on PR
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.REVIEW_BOT_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: process.env.REVIEW_RESPONSE
+            });
