@@ -24,16 +24,47 @@ jobs:
           cat diff.txt >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      - name: Request code review to LLM
+      - name: Send to LLM for review
         run: |
           ESCAPED_DIFF=$(echo "$DIFF_CONTENT" | jq -sRr @json)
+
+          PROMPT=$(jq -n --arg diff "$ESCAPED_DIFF" '
+            "You are a senior-level software engineer performing a thorough code review.
+
+            Given the following git diff, do the following:
+
+            1. Provide a short summary of what the PR does.
+            2. For each issue you find:
+                - Include the file path and line number
+                - Quote the original code line
+                - Propose a better version
+                - Explain why your suggestion improves the code
+
+            Use the following format:
+
+            📄 <file_path>
+
+            - [Line <line_number>]
+              \`\`\`original code\`\`\`
+              → Suggested change:
+              \`\`\`suggested code\`\`\`
+              **Reason**: explanation...
+
+            Here is the git diff:
+
+            \($diff)"
+          ')
+
           REQUEST_BODY=$(jq -n \
             --arg model "${{ secrets.REVIEW_MODEL_NAME }}" \
-            --arg prompt "Review the following code changes and provide concise feedback:\n$ESCAPED_DIFF" \
-            '{model: $model, prompt: $prompt, stream: false}')
+            --arg prompt "$PROMPT" \
+            '{model: $model, prompt: $prompt, stream: false}'
+          )
+
           RESPONSE=$(curl -s -X POST ${{ secrets.REVIEW_API_URL }} \
             -H "Content-Type: application/json" \
             -d "$REQUEST_BODY" | jq -r .response)
+
           echo "REVIEW_RESPONSE<<EOF" >> $GITHUB_ENV
           echo "$RESPONSE" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
