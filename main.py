@@ -1,5 +1,16 @@
-print("hello world")
+def hello():
+    print("hello world")
 
-print("hello korea")
+def hello2():
+    print("hello korea")
 
-print("hello python")
+def hello3():
+    print("hello python")
+
+def main():
+    hello()
+    hello2()
+    hello3()
+
+if __name__ == "__main__":
+    main()
