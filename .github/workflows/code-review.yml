@@ -1,82 +1,116 @@
-name: CodeReview
+name: Ollama Code Review
 
 on:
+  push:
+    branches: [feature/gemini]
+    paths:
+      - "backend/**"
   pull_request:
-    branches:
-      - main
-      - develop
+    types: [opened, synchronize]
 
 jobs:
-  review:
+  code-review:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
-      - name: Check out code
+      - name: Checkout repository
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
 
-      - name: Get git diff
+      - name: Get git diff for PR
+        if: github.event_name == 'pull_request'
         run: |
-          git fetch origin
-          git diff --unified=3 ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} > diff.txt
-          echo "DIFF_CONTENT<<EOF" >> $GITHUB_ENV
-          cat diff.txt >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          git fetch origin "${{ github.event.pull_request.base.ref }}"
+          git fetch origin "${{ github.event.pull_request.head.ref }}"
+          git diff --unified=0 "origin/${{ github.event.pull_request.base.ref }}"..."origin/${{ github.event.pull_request.head.ref }}" > diff.txt
+          echo "EVENT_TYPE=pull_request" >> $GITHUB_ENV
 
-      - name: Send to LLM for review
+      - name: Get git diff for Push
+        if: github.event_name == 'push'
         run: |
-          ESCAPED_DIFF=$(echo "$DIFF_CONTENT" | jq -sRr @json)
+          git diff --unified=0 HEAD^ HEAD > diff.txt
+          echo "EVENT_TYPE=push" >> $GITHUB_ENV
 
-          PROMPT=$(jq -n --arg diff "$ESCAPED_DIFF" '
-            "You are a senior-level software engineer performing a thorough code review.
+      - name: Run Ollama Review
+        run: |
+          DIFF=$(cat diff.txt | jq -sRr @json)
 
-            Given the following git diff, do the following:
+          if [ "$EVENT_TYPE" = "pull_request" ]; then
+            PROMPT=$(cat <<EOF
+          You are a senior software engineer and need to perform a code review based on the results of a given git diff.
 
-            1. Provide a short summary of what the PR does.
-            2. For each issue you find:
-                - Include the file path and line number
-                - Quote the original code line
-                - Propose a better version
-                - Explain why your suggestion improves the code
+          Review the changed code carefully and respond in **JSON format** only, using this structure:
 
-            Use the following format:
+          [
+            {
+              "path": "<file_path>",
+              "line": <line_number>,
+              "text": "<review comment>",
+              "side": "RIGHT"
+            }
+          ]
 
-            📄 <file_path>
+          Base your line numbers on the @@ line chunk markers in the diff. Output only valid JSON.
 
-            - [Line <line_number>]
-              \`\`\`original code\`\`\`
-              → Suggested change:
-              \`\`\`suggested code\`\`\`
-              **Reason**: explanation...
+          <git diff> $DIFF </git diff>
+          EOF
+          )
+                    else
+                      PROMPT=$(cat <<EOF
+          You are a senior software engineer and need to provide a code review based on the following git diff.
 
-            Here is the git diff:
+          Offer detailed feedback in Markdown with headings per file.
 
-            \($diff)"
-          ')
+          <git diff> $DIFF </git diff>
+          EOF
+          )
+          fi
 
           REQUEST_BODY=$(jq -n \
             --arg model "${{ secrets.REVIEW_MODEL_NAME }}" \
             --arg prompt "$PROMPT" \
-            '{model: $model, prompt: $prompt, stream: false}'
-          )
+            '{model: $model, prompt: $prompt, stream: false}')
 
-          RESPONSE=$(curl -s -X POST ${{ secrets.REVIEW_API_URL }} \
+          echo "$REQUEST_BODY" > body.json
+
+          RESPONSE=$(curl -s -X POST "${{ secrets.REVIEW_API_URL }}" \
             -H "Content-Type: application/json" \
-            -d "$REQUEST_BODY" | jq -r .response)
+            -d @body.json | jq -r .response)
 
-          echo "REVIEW_RESPONSE<<EOF" >> $GITHUB_ENV
-          echo "$RESPONSE" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
+          echo "$RESPONSE" > review_result.txt
+          echo "REVIEW DONE"
 
-      - name: Post review comment on PR
-        uses: actions/github-script@v6
+      - name: Format and parse PR review comments
+        if: env.EVENT_TYPE == 'pull_request'
+        id: parse
+        run: |
+          sed '/^```/d' review_result.txt > cleaned.txt
+          COMMENT=$(cat cleaned.txt | jq -c .)
+          echo "comment=$COMMENT" >> $GITHUB_OUTPUT
+
+      - name: Add Pull Request Review Comment
+        if: env.EVENT_TYPE == 'pull_request'
+        uses: nbaztec/add-pr-review-comment@v1.0.7
         with:
-          github-token: ${{ secrets.REVIEW_BOT_TOKEN }}
-          script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: process.env.REVIEW_RESPONSE
-            });
+          comments: ${{ steps.parse.outputs.comment }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          repo-token-user-login: "github-actions[bot]"
+          allow-repeats: false
+
+      - name: Display review results in workflow log
+        if: env.EVENT_TYPE == 'push'
+        run: |
+          echo "===== Ollama Code Review Results ====="
+          cat review_result.txt
+          echo "======================================"
+
+      - name: Upload review results as artifact
+        if: env.EVENT_TYPE == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-code-review
+          path: review_result.txt
